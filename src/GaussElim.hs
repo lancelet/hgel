@@ -1,18 +1,20 @@
 {-# LANGUAGE BangPatterns #-}
 module GaussElim where
 
+import Control.Monad.ST (runST)
 import Control.Monad.Primitive (PrimMonad, PrimState)
 import Data.Primitive.MutVar (MutVar, newMutVar, readMutVar, writeMutVar)
-import Data.Vector.Generic (Vector)
+import Data.Vector.Generic (Vector, Mutable)
 import Data.Vector.Generic.Mutable (MVector)
 import qualified Data.Vector.Generic.Mutable as M
 import qualified Data.Vector.Generic as V
+import qualified Data.Vector.Unboxed as U
 
 newtype RowI = RowI Int
 newtype ColI = ColI Int
 newtype LinI = LinI { unLinI :: Int }
-newtype NRows = NRows { unNRows :: Int }
-newtype NCols = NCols { unNCols :: Int }
+newtype NRows = NRows { unNRows :: Int } deriving Show
+newtype NCols = NCols { unNCols :: Int } deriving Show
 
 
 data Matrix v a
@@ -20,7 +22,47 @@ data Matrix v a
       { nCols   :: NCols
       , nRows   :: NRows
       , backing :: v a
-      }
+      } deriving Show
+
+
+m :: Matrix U.Vector Float
+m = case fromList (NCols 3) [ 1, 2, 4, 5, 2, 4, 8, 9, 1 ] of
+        Just m  -> m
+        Nothing -> error "fromList failed for example"
+
+    
+thaw
+    :: ( Vector v a
+       , PrimMonad m )
+    => Matrix v a
+    -> m (Matrix (Mutable v (PrimState m)) a)
+thaw matrix = do
+    backing' <- V.thaw (backing matrix)
+    pure (matrix { backing = backing' })
+
+
+freeze
+    :: ( Vector v a
+       , PrimMonad m )
+    => Matrix (Mutable v (PrimState m)) a
+    -> m (Matrix v a)
+freeze matrix = do
+    backing' <- V.freeze (backing matrix)
+    pure (matrix { backing = backing' })
+
+
+fromList
+    :: (Vector v a)
+    => NCols
+    -> [a]
+    -> Maybe (Matrix v a)
+fromList nc xs =
+    if V.length v `mod` unNCols nc == 0
+    then Just (Matrix nc (NRows nr) v)
+    else Nothing
+  where
+    v = V.fromList xs
+    nr = V.length v `quot` unNCols nc
 
 
 colOK :: Matrix v a -> ColI -> Bool
@@ -37,6 +79,9 @@ rowOK matrix (RowI i) = i < unNRows (nRows matrix)
 
 incRow :: RowI -> RowI
 incRow (RowI i) = RowI (i + 1)
+
+rowToCol :: RowI -> ColI
+rowToCol (RowI i) = ColI i
 
     
 index
@@ -103,11 +148,12 @@ colMax
        , PrimMonad m )
     => Matrix (v (PrimState m)) a
     -> ColI
+    -> RowI
     -> m RowI
-colMax matrix j = do
-    e0  <- getElem matrix (RowI 0) j
-    cur <- newMutVar (RowI 0, e0)
-    loopRows matrix (RowI 0) $ \i -> do
+colMax matrix j from_i = do
+    e0  <- getElem matrix from_i j
+    cur <- newMutVar (from_i, e0)
+    loopRows matrix from_i $ \i -> do
         e      <- getElem matrix i j
         curMax <- snd <$> readMutVar cur
         if e > curMax
@@ -115,6 +161,55 @@ colMax matrix j = do
             else pure ()
     fst <$> readMutVar cur
 
+
+-- | @e(ib, j) += c * e(ia, j)@
+mulAddRows
+    :: ( Num a
+       , MVector v a
+       , PrimMonad m )
+    => Matrix (v (PrimState m)) a
+    -> (RowI, a)                   -- ^ (ia, c) : source row and coefficient
+    -> RowI                        -- ^ ib      : destination row
+    -> m ()
+mulAddRows matrix (ia, c) ib = 
+    loopCols matrix (ColI 0) $ \j -> do
+        eDest <- getElem matrix ia j
+        eSrc  <- getElem matrix ib j
+        let eDest' = eDest + c * eSrc
+        setElem matrix ib j eDest'
+
+
+upperTriangular
+    :: ( Num a
+       , Fractional a
+       , Ord a
+       , MVector v a
+       , PrimMonad m )
+    => Matrix (v (PrimState m)) a
+    -> m ()
+upperTriangular matrix =
+    loopRows matrix (RowI 0) $ \i -> do
+        pivotRow <- colMax matrix (rowToCol i) i
+        pivotEl  <- getElem matrix pivotRow (rowToCol i)
+        swapRows matrix i pivotRow
+        loopRows matrix (incRow i) $ \i' -> do
+            initEl <- getElem matrix i' (rowToCol i)
+            let coeff = (-1) * initEl / pivotEl
+            mulAddRows matrix (i, coeff) i'
+
+
+upperTriangular'
+    :: ( Num a
+       , Fractional a
+       , Ord a
+       , Vector v a )
+    => Matrix v a
+    -> Matrix v a
+upperTriangular' matrix = runST $ do
+    matrix' <- thaw matrix
+    upperTriangular matrix'
+    freeze matrix'
+    
 
 loopRows
     :: (Monad m)
