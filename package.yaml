@@ -49,3 +49,7 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - hgel
+    - containers
+    - hedgehog
+    - tasty
+    - tasty-hedgehog
